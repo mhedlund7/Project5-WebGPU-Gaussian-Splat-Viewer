@@ -24,12 +24,12 @@ export interface SortStuff {
 }
 
 
-function create_ping_pong_buffer(adjusted_count: number, _keysize: number, device: GPUDevice) {
+function create_ping_pong_buffer(adjusted_count: number, keysize: number, device: GPUDevice) {
   return {
     // payload
     sort_indices_buffer: device.createBuffer({
       label: 'ping pong sort indices',
-      size: adjusted_count * 4,
+      size: keysize * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     }),
     // key
