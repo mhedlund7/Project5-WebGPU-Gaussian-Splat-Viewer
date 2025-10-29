@@ -57,9 +57,27 @@ struct Gaussian {
 
 struct Splat {
     //TODO: store information for 2D splat rendering
+    ndc_center: vec2<f32>,
+    radius: vec2<f32>,
+    ndc_depth: f32,
+    pad: f32,
+    color: vec4<f32>,
+    conic_opacity: vec4<f32>,
 };
 
 //TODO: bind your data here
+
+@group(0) @binding(0)
+var<uniform> camera: CameraUniforms;
+@group(1) @binding(0)
+var<storage, read> gaussians : array<Gaussian>;
+@group(1) @binding(1)
+var<storage, read_write> splats: array<Splat>;
+@group(1) @binding(2)
+var<uniform> render_settings: RenderSettings;
+@group(1) @binding(3)
+var<storage, read> sh_buffer: array<u32>;
+
 @group(2) @binding(0)
 var<storage, read_write> sort_infos: SortInfos;
 @group(2) @binding(1)
@@ -69,11 +87,120 @@ var<storage, read_write> sort_indices : array<u32>;
 @group(2) @binding(3)
 var<storage, read_write> sort_dispatch: DispatchIndirect;
 
+// see if ndc point is inside bounding box for 1.2x frustum
+fn in_ndc_bounding_box(ndc_pos: vec3<f32>) -> bool {
+    let s = 1.2;
+    return ndc_pos.x >= -s && ndc_pos.x <= s &&
+           ndc_pos.y >= -s && ndc_pos.y <= s &&
+           ndc_pos.z > -0.0;
+}
+
 /// reads the ith sh coef from the storage buffer 
 fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
     //TODO: access your binded sh_coeff, see load.ts for how it is stored
-    return vec3<f32>(0.0);
+    let idx = splat_idx * 24 + 3 * c_idx / 2 + c_idx % 2;
+
+    let colrg = unpack2x16float(sh_buffer[idx]);
+    let colba = unpack2x16float(sh_buffer[idx + 1]);
+
+    if (c_idx % 2 == 0) {
+        return vec3<f32>(colrg.x, colrg.y, colba.x);
+    } else {
+        return vec3<f32>(colrg.y, colba.x, colba.y);
+    }
 }
+
+fn mat3_from_quat(q: vec4<f32>) -> mat3x3<f32> {
+    let x = q.x;
+    let y = q.y;
+    let z = q.z;
+    let r = q.w;
+    return mat3x3<f32>(
+        vec3<f32>(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * r), 2.0 * (x * z + y * r)),
+        vec3<f32>(2.0 * (x * y + z * r), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * r)),
+        vec3<f32>(2.0 * (x * z - y * r), 2.0 * (y * z + x * r), 1.0 - 2.0 * (x * x + y * y))
+    );
+}
+
+fn compute3DCovarianceFromGaussian(g: Gaussian, modifier: f32) -> mat3x3<f32> {
+    let scale_xy = unpack2x16float(g.scale[0]);
+    let scale_zw = unpack2x16float(g.scale[1]);
+    let scales = vec3<f32>(
+        exp(scale_xy.x), 
+        exp(scale_xy.y), 
+        exp(scale_zw.x)
+    );
+
+    // Debug: clamp scales to reasonable values
+    let rot_xy = unpack2x16float(g.rot[0]);
+    let rot_zr = unpack2x16float(g.rot[1]);
+    let quat = vec4<f32>(rot_xy.x, rot_xy.y, rot_zr.x, rot_zr.y);
+    let rot_mat = mat3_from_quat(quat);
+
+    let scale_mat = mat3x3<f32>(
+        vec3<f32>(modifier * scales.x, 0.0, 0.0),
+        vec3<f32>(0.0, modifier * scales.y, 0.0),
+        vec3<f32>(0.0, 0.0, modifier * scales.z)
+    );
+
+    let covariance = rot_mat * scale_mat * transpose(scale_mat) * transpose(rot_mat);
+    return covariance;
+}
+
+fn compute2DCovarianceFromGaussian(g: Gaussian, view_pos3: vec3<f32>, modifier: f32, cam: CameraUniforms) -> mat3x3<f32> {
+    let cov3D = compute3DCovarianceFromGaussian(g, modifier);
+
+
+    let fx = cam.focal.x;
+    let fy = cam.focal.y;
+
+    let jacobian = mat3x3<f32>(
+        vec3<f32>(fx / view_pos3.z, 0.0, -fx * view_pos3.x / (view_pos3.z * view_pos3.z)),
+        vec3<f32>(0.0, fy / view_pos3.z, -fy * view_pos3.y / (view_pos3.z * view_pos3.z)),
+        vec3<f32>(0.0, 0.0, 0.0)
+    );
+
+    let W = transpose(mat3x3<f32>(cam.view[0].xyz, cam.view[1].xyz, cam.view[2].xyz));
+
+    let T = W * jacobian;
+
+    let Vrk = mat3x3f(
+        cov3D[0][0], cov3D[0][1], cov3D[0][2],
+        cov3D[0][1], cov3D[1][1], cov3D[1][2],
+        cov3D[0][2], cov3D[1][2], cov3D[2][2]
+    );
+
+    var cov2D = transpose(T) * Vrk * T;
+
+    cov2D[0][0] += 0.3;
+    cov2D[1][1] += 0.3;
+
+    return cov2D;
+}
+
+fn computeRadiusFromCovariance(cov2D: mat3x3<f32>) -> f32 {
+    let det = cov2D[0][0] * cov2D[1][1] - cov2D[0][1] * cov2D[1][0];
+    let mid = 0.5 * (cov2D[0][0] + cov2D[1][1]);
+    let lambdaOffset = sqrt(max(0.1, mid * mid - det));
+
+    let lambda1 = mid + lambdaOffset;
+    let lambda2 = mid - lambdaOffset;
+
+    let max_lambda = max(lambda1, lambda2);
+
+    let radius = ceil(3.0 * sqrt(max_lambda));
+    return radius;
+}
+
+fn computeConicFromCovariance(cov2D: mat3x3<f32>) -> mat2x2<f32> {
+    let det = cov2D[0][0] * cov2D[1][1] - cov2D[0][1] * cov2D[1][0];
+    let det_inv = 1.0 / det;
+    return det_inv * mat2x2<f32>(
+        cov2D[1][1], -cov2D[0][1],
+        -cov2D[1][0], cov2D[0][0]
+    );
+}
+
 
 // spherical harmonics evaluation with Condon–Shortley phase
 fn computeColorFromSH(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
@@ -105,7 +232,7 @@ fn computeColorFromSH(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
     }
     result += 0.5;
 
-    return  max(vec3<f32>(0.), result);
+    return max(vec3<f32>(0.), result);
 }
 
 @compute @workgroup_size(workgroupSize,1,1)
@@ -113,6 +240,67 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let idx = gid.x;
     //TODO: set up pipeline as described in instruction
 
+    let n = arrayLength(&gaussians);
+    if (idx >= n) {
+        return;
+    }
+
+    let g = gaussians[idx];
+    // stored as x, y, z, opacity
+    let a = unpack2x16float(g.pos_opacity[0]);
+    let b = unpack2x16float(g.pos_opacity[1]);
+    let world_pos = vec4<f32>(a.x, a.y, b.x, 1.0);
+    let opacity = 1.0 / (1.0 + exp(-b.y));
+
+    // convert from world to ndc space
+    let view_pos = camera.view * world_pos;
+    let clip_pos = camera.proj * view_pos;
+    let ndc_pos = clip_pos.xyz / clip_pos.w;
+
+    // discard splats outside of ndc bounding box
+    if (!in_ndc_bounding_box(ndc_pos)) {
+        return;
+    }
+
+    // fill in splat info
+    var splat: Splat;
+    splat.ndc_center = ndc_pos.xy;
+
+    // use quad to represent splat for now
+    // evaluate radius
+
+    let view_pos3 = (camera.view * world_pos).xyz;
+    let cov2D = compute2DCovarianceFromGaussian(g, view_pos3, render_settings.gaussian_scaling, camera);
+    let conic = computeConicFromCovariance(cov2D);
+    let conic_opacity = vec4<f32>(conic[0][0], conic[0][1], conic[1][1], opacity);
+    let radius = computeRadiusFromCovariance(cov2D);
+
+
+    let radius2D = radius * vec2<f32>(1.0, 1.0) / camera.viewport;
+    splat.radius = radius2D; // assuming square viewport
+    splat.ndc_depth = ndc_pos.z;
+    splat.conic_opacity = conic_opacity;
+    
+    // evaluate color
+
+
+    let sh_deg = u32(render_settings.sh_deg);
+    let camera_pos = -camera.view[3].xyz;
+
+    let view_dir = normalize(world_pos.xyz - camera_pos);
+    let color = computeColorFromSH(view_dir, idx, sh_deg);
+    splat.color = vec4<f32>(color, 1.0);
+
+    let splat_idx = atomicAdd(&sort_infos.keys_size, 1);
+
+    splats[splat_idx] = splat;
+
+    sort_depths[splat_idx] = bitcast<u32>(100.0 - view_pos.z);
+    sort_indices[splat_idx] = splat_idx;
+
     let keys_per_dispatch = workgroupSize * sortKeyPerThread; 
     // increment DispatchIndirect.dispatchx each time you reach limit for one dispatch of keys
+    if (splat_idx % keys_per_dispatch == 0) {
+        atomicAdd(&sort_dispatch.dispatch_x, 1);
+    }
 }
